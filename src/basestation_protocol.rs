@@ -13,6 +13,56 @@ pub enum PacketType {
     Command = 0x0003,
 }
 
+#[repr(u16)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MowerCommandId {
+    Move = 0x0001,
+    Turn = 0x0002,
+    Stop = 0x0003,
+    Pause = 0x0004,
+    Resume = 0x0005,
+    SetSpeed = 0x0006,
+    Blades = 0x0007,
+}
+
+impl MowerCommandId {
+    pub fn from_u16(value: u16) -> Option<Self> {
+        match value {
+            0x0001 => Some(Self::Move),
+            0x0002 => Some(Self::Turn),
+            0x0003 => Some(Self::Stop),
+            0x0004 => Some(Self::Pause),
+            0x0005 => Some(Self::Resume),
+            0x0006 => Some(Self::SetSpeed),
+            0x0007 => Some(Self::Blades),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpsFixStatus {
+    Void = 0,
+    Valid = 1,
+}
+
+impl GpsFixStatus {
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DecodedMowerCommand<'a> {
+    pub packet_seq_num: u16,
+    pub mower_id: u16,
+    pub utc_timestamp: u16,
+    pub ack_request_flag: u8,
+    pub command_id: Option<MowerCommandId>,
+    pub raw_command_id: u16,
+    pub control_parameter: &'a [u8],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MowerConfigPacket {
@@ -25,6 +75,9 @@ pub struct MowerConfigPacket {
     pub fault_flags: u16,
     pub reserved1: u32,
     pub reserved2: u32,
+    // The current Pi-side implementation still uses a 16-bit checksum here.
+    // The design notes mention a 32-bit checksum, but changing this now would
+    // break wire compatibility with the existing base station.
     pub checksum: u16,
 }
 
@@ -46,6 +99,7 @@ pub struct GpsTelemetryPacket {
     pub mower_id: u16,
     pub utc_timestamp: u16,
     pub utc_of_gps_fix: u16,
+    // 1 = valid, 0 = void. This mirrors RMC A/V at the current wire level.
     pub gps_fix_status: u8,
     pub latitude: f32,
     pub lat_hemisphere: u8,
@@ -197,6 +251,38 @@ impl GpsTelemetryPacket {
     }
 }
 
+impl MowerCommandPacket {
+    pub const PACKET_LEN: usize = core::mem::size_of::<Self>();
+    const HEADER_LEN: usize = 20;
+    const PARAM_OFFSET: usize = 20;
+    const PARAM_CAPACITY: usize = 256;
+
+    pub fn decode(bytes: &[u8]) -> Option<DecodedMowerCommand<'_>> {
+        if bytes.len() < Self::HEADER_LEN {
+            return None;
+        }
+
+        let raw_command_id = read_u16_le(bytes, 16)?;
+        let param_len = read_u16_le(bytes, 18)? as usize;
+        let available_param_bytes = bytes.len().saturating_sub(Self::PARAM_OFFSET);
+        let param_len = core::cmp::min(
+            core::cmp::min(param_len, Self::PARAM_CAPACITY),
+            available_param_bytes,
+        );
+        let param_end = Self::PARAM_OFFSET + param_len;
+
+        Some(DecodedMowerCommand {
+            packet_seq_num: read_u16_le(bytes, 2)?,
+            mower_id: read_u16_le(bytes, 4)?,
+            utc_timestamp: read_u16_le(bytes, 6)?,
+            ack_request_flag: *bytes.get(8)?,
+            command_id: MowerCommandId::from_u16(raw_command_id),
+            raw_command_id,
+            control_parameter: bytes.get(Self::PARAM_OFFSET..param_end)?,
+        })
+    }
+}
+
 pub fn checksum16(data: &[u8]) -> u16 {
     let mut sum = 0_u32;
     for &byte in data {
@@ -213,4 +299,10 @@ fn as_bytes<T>(value: &T) -> &[u8] {
 
 fn prefix_bytes<T>(value: &T, len: usize) -> &[u8] {
     unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), len) }
+}
+
+fn read_u16_le(bytes: &[u8], offset: usize) -> Option<u16> {
+    let lo = *bytes.get(offset)?;
+    let hi = *bytes.get(offset + 1)?;
+    Some(u16::from_le_bytes([lo, hi]))
 }

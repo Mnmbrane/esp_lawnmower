@@ -8,20 +8,23 @@
 #![deny(clippy::large_stack_frames)]
 
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either, select};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{Config as NetConfig, Ipv4Address, Runner, Stack, StackResources};
 use embassy_time::{Duration, Timer};
-use embedded_io_async::{Read, Write};
+use embedded_io_async::Write;
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::time::Instant;
 use esp_hal::timer::timg::TimerGroup;
-use esp_hal::uart::{Config as UartConfig, UartRx};
 use esp_radio::wifi::Interface as WifiInterface;
 use esp_radio::wifi::{self, AuthenticationMethod, Config, sta::StationConfig};
 use lawnmower_esp_rs::app_config::APP_CONFIG;
-use lawnmower_esp_rs::basestation_protocol::{AckPacket, GpsTelemetryPacket, MowerConfigPacket};
+use lawnmower_esp_rs::basestation_protocol::{
+    AckPacket, DecodedMowerCommand, GpsFixStatus, GpsTelemetryPacket, MowerCommandPacket,
+    MowerConfigPacket,
+};
 use log::info;
 use static_cell::StaticCell;
 
@@ -34,6 +37,15 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 static WIFI_INTERFACE: StaticCell<WifiInterface<'static>> = StaticCell::new();
 static NET_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+
+#[derive(Clone, Copy, Debug)]
+enum RegistrationError {
+    TcpConnectFailed,
+    TcpWriteFailed,
+    TcpReadFailed,
+    EmptyResponse,
+    InvalidResponse,
+}
 
 #[embassy_executor::task]
 async fn net_task(mut runner: Runner<'static, &'static mut WifiInterface<'static>>) -> ! {
@@ -56,7 +68,7 @@ async fn basestation_task(stack: Stack<'static>) -> ! {
         let assigned_ctrl_port = match register_with_basestation(stack, remote, local_ip).await {
             Ok(port) => port,
             Err(err) => {
-                info!("Base station registration failed: {}. Retrying.", err);
+                info!("Base station registration failed: {:?}. Retrying.", err);
                 Timer::after(Duration::from_secs(2)).await;
                 continue;
             }
@@ -91,48 +103,65 @@ async fn basestation_task(stack: Stack<'static>) -> ! {
         );
 
         let server_endpoint = (remote.0, assigned_ctrl_port);
-        let fake_gps = GpsTelemetryPacket::new(
-            1,
-            APP_CONFIG.base_station.initial_mower_id,
-            unix_time_u16(),
-            unix_time_u16(),
-            1,
-            42.3601,
-            b'N',
-            71.0589,
-            b'W',
-            0.0,
-            0.0,
-        );
-        if let Err(err) = socket.send_to(fake_gps.as_bytes(), server_endpoint).await {
-            info!("Failed to send fake GPS telemetry: {:?}.", err);
-        } else {
-            info!("Sent fake GPS telemetry packet to base station.");
-        }
+        let mut telemetry_seq_num = 1_u16;
 
         loop {
             let mut cmd_buffer = [0_u8; 1024];
-            let (bytes_read, _endpoint) = match socket.recv_from(&mut cmd_buffer).await {
-                Ok(result) => result,
-                Err(err) => {
-                    info!("UDP command receive failed: {:?}. Re-registering.", err);
-                    break;
+            match select(
+                socket.recv_from(&mut cmd_buffer),
+                Timer::after(Duration::from_secs(1)),
+            )
+            .await
+            {
+                Either::First(recv_result) => {
+                    let (bytes_read, _endpoint) = match recv_result {
+                        Ok(result) => result,
+                        Err(err) => {
+                            info!("UDP command receive failed: {:?}. Re-registering.", err);
+                            break;
+                        }
+                    };
+
+                    let orig_seq_num = parse_u16_le(&cmd_buffer, 2).unwrap_or(0);
+                    if let Some(command) =
+                        MowerCommandPacket::decode(&cmd_buffer[..bytes_read])
+                    {
+                        log_command(command, bytes_read);
+                    } else {
+                        info!(
+                            "Received UDP command packet: bytes={} seq={} decode=failed.",
+                            bytes_read, orig_seq_num
+                        );
+                    }
+
+                    let ack = AckPacket::new(
+                        orig_seq_num,
+                        APP_CONFIG.base_station.initial_mower_id,
+                        unix_time_u16(),
+                    );
+                    if let Err(err) = socket.send_to(ack.as_bytes(), server_endpoint).await {
+                        info!("Failed to send UDP ACK: {:?}. Re-registering.", err);
+                        break;
+                    }
+
+                    info!("Sent UDP ACK for seq {}.", orig_seq_num);
                 }
-            };
-
-            let orig_seq_num = parse_u16_le(&cmd_buffer, 2).unwrap_or(0);
-            info!(
-                "Received UDP command packet: bytes={} seq={}.",
-                bytes_read, orig_seq_num
-            );
-
-            let ack = AckPacket::new(orig_seq_num, 0, unix_time_u16());
-            if let Err(err) = socket.send_to(ack.as_bytes(), server_endpoint).await {
-                info!("Failed to send UDP ACK: {:?}. Re-registering.", err);
-                break;
+                Either::Second(_) => {
+                    let telemetry = fake_gps_telemetry(telemetry_seq_num);
+                    if let Err(err) = socket.send_to(telemetry.as_bytes(), server_endpoint).await {
+                        info!(
+                            "Failed to send fake GPS telemetry: {:?}. Re-registering.",
+                            err
+                        );
+                        break;
+                    }
+                    telemetry_seq_num = telemetry_seq_num.wrapping_add(1);
+                    info!(
+                        "Sent fake GPS telemetry packet seq={}.",
+                        telemetry_seq_num - 1
+                    );
+                }
             }
-
-            info!("Sent UDP ACK for seq {}.", orig_seq_num);
         }
 
         Timer::after(Duration::from_secs(1)).await;
@@ -143,7 +172,7 @@ async fn register_with_basestation(
     stack: Stack<'static>,
     remote: (Ipv4Address, u16),
     local_ip: Ipv4Address,
-) -> Result<u16, &'static str> {
+) -> Result<u16, RegistrationError> {
     let mut rx_buffer = [0_u8; 1024];
     let mut tx_buffer = [0_u8; 1024];
     let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
@@ -156,7 +185,7 @@ async fn register_with_basestation(
     socket
         .connect(remote)
         .await
-        .map_err(|_| "tcp connect failed")?;
+        .map_err(|_| RegistrationError::TcpConnectFailed)?;
     info!(
         "Connected to base station {}:{}.",
         APP_CONFIG.base_station.ip, APP_CONFIG.base_station.registration_port
@@ -167,19 +196,19 @@ async fn register_with_basestation(
     socket
         .write_all(cfg_packet.as_bytes())
         .await
-        .map_err(|_| "tcp write failed")?;
+        .map_err(|_| RegistrationError::TcpWriteFailed)?;
     info!("Sent configuration packet to base station.");
 
     let mut response = [0_u8; 64];
     let bytes_read = socket
         .read(&mut response)
         .await
-        .map_err(|_| "tcp read failed")?;
+        .map_err(|_| RegistrationError::TcpReadFailed)?;
     if bytes_read == 0 {
-        return Err("empty registration response");
+        return Err(RegistrationError::EmptyResponse);
     }
 
-    parse_port_ascii(&response[..bytes_read]).ok_or("invalid registration response")
+    parse_port_ascii(&response[..bytes_read]).ok_or(RegistrationError::InvalidResponse)
 }
 
 fn parse_ipv4(ip: &str) -> Ipv4Address {
@@ -213,6 +242,41 @@ fn parse_u16_le(bytes: &[u8], offset: usize) -> Option<u16> {
 
 fn unix_time_u16() -> u16 {
     (Instant::now().duration_since_epoch().as_secs() & 0xFFFF) as u16
+}
+
+fn fake_gps_telemetry(packet_seq_num: u16) -> GpsTelemetryPacket {
+    let lat = 37.7749_f32;
+    let lon = -122.4194_f32;
+    let heading = 315.0_f32;
+    let timestamp = unix_time_u16();
+
+    GpsTelemetryPacket::new(
+        packet_seq_num,
+        APP_CONFIG.base_station.initial_mower_id,
+        timestamp,
+        timestamp,
+        GpsFixStatus::Valid.as_u8(),
+        lat.abs(),
+        if lat >= 0.0 { b'N' } else { b'S' },
+        lon.abs(),
+        if lon >= 0.0 { b'E' } else { b'W' },
+        1.5,
+        heading,
+    )
+}
+
+fn log_command(command: DecodedMowerCommand<'_>, bytes_read: usize) {
+    info!(
+        "Received UDP command: bytes={} seq={} mower_id={} utc={} ack_req={} cmd={:?}/0x{:04x} param_len={}.",
+        bytes_read,
+        command.packet_seq_num,
+        command.mower_id,
+        command.utc_timestamp,
+        command.ack_request_flag,
+        command.command_id,
+        command.raw_command_id,
+        command.control_parameter.len(),
+    );
 }
 
 #[allow(
@@ -298,21 +362,7 @@ async fn main(spawner: Spawner) -> ! {
     }
     spawner.spawn(basestation_task(net_stack).unwrap());
 
-    // GT-U7 modules typically speak NMEA at 9600 baud over UART.
-    // Keep the pin/baud in APP_CONFIG so hardware changes stay in one place.
-    let mut gps_rx = UartRx::new(
-        peripherals.UART1,
-        UartConfig::default().with_baudrate(APP_CONFIG.gps.uart_baudrate),
-    )
-    .unwrap()
-    .with_rx(peripherals.GPIO17);
-
     info!("Embassy initialized!");
-    info!(
-        "Reading GPS NMEA from UART1 on GPIO{} / D7 at {} baud.",
-        APP_CONFIG.gps.rx_gpio, APP_CONFIG.gps.uart_baudrate
-    );
-    info!("Connect GT-U7 TX -> D7, GND -> GND, and power the module.");
     info!(
         "Configured base station target: {}:{} mower_id={}.",
         APP_CONFIG.base_station.ip,
@@ -320,7 +370,6 @@ async fn main(spawner: Spawner) -> ! {
         APP_CONFIG.base_station.initial_mower_id
     );
     loop {
-        let _ = &mut gps_rx;
         Timer::after(Duration::from_secs(60)).await;
     }
 
