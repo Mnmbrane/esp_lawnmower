@@ -21,7 +21,7 @@ use esp_hal::uart::{Config as UartConfig, UartRx};
 use esp_radio::wifi::Interface as WifiInterface;
 use esp_radio::wifi::{self, AuthenticationMethod, Config, sta::StationConfig};
 use lawnmower_esp_rs::app_config::APP_CONFIG;
-use lawnmower_esp_rs::basestation_protocol::{AckPacket, MowerConfigPacket};
+use lawnmower_esp_rs::basestation_protocol::{AckPacket, GpsTelemetryPacket, MowerConfigPacket};
 use log::info;
 use static_cell::StaticCell;
 
@@ -91,6 +91,24 @@ async fn basestation_task(stack: Stack<'static>) -> ! {
         );
 
         let server_endpoint = (remote.0, assigned_ctrl_port);
+        let fake_gps = GpsTelemetryPacket::new(
+            1,
+            APP_CONFIG.base_station.initial_mower_id,
+            unix_time_u16(),
+            unix_time_u16(),
+            1,
+            42.3601,
+            b'N',
+            71.0589,
+            b'W',
+            0.0,
+            0.0,
+        );
+        if let Err(err) = socket.send_to(fake_gps.as_bytes(), server_endpoint).await {
+            info!("Failed to send fake GPS telemetry: {:?}.", err);
+        } else {
+            info!("Sent fake GPS telemetry packet to base station.");
+        }
 
         loop {
             let mut cmd_buffer = [0_u8; 1024];
