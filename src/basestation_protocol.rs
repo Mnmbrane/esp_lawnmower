@@ -118,7 +118,10 @@ impl MowerConfigPacket {
     }
 
     fn bytes_without_checksum(&self) -> &[u8] {
-        prefix_bytes(self, core::mem::size_of::<Self>() - core::mem::size_of::<u16>())
+        prefix_bytes(
+            self,
+            core::mem::size_of::<Self>() - core::mem::size_of::<u16>(),
+        )
     }
 }
 
@@ -140,7 +143,10 @@ impl AckPacket {
     }
 
     fn bytes_without_checksum(&self) -> &[u8] {
-        prefix_bytes(self, core::mem::size_of::<Self>() - core::mem::size_of::<u16>())
+        prefix_bytes(
+            self,
+            core::mem::size_of::<Self>() - core::mem::size_of::<u16>(),
+        )
     }
 }
 
@@ -184,7 +190,10 @@ impl GpsTelemetryPacket {
     }
 
     fn bytes_without_checksum(&self) -> &[u8] {
-        prefix_bytes(self, core::mem::size_of::<Self>() - core::mem::size_of::<u32>())
+        prefix_bytes(
+            self,
+            core::mem::size_of::<Self>() - core::mem::size_of::<u32>(),
+        )
     }
 }
 
@@ -197,7 +206,9 @@ pub fn checksum16(data: &[u8]) -> u16 {
 }
 
 fn as_bytes<T>(value: &T) -> &[u8] {
-    unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>()) }
+    unsafe {
+        core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>())
+    }
 }
 
 fn prefix_bytes<T>(value: &T, len: usize) -> &[u8] {

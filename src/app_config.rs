@@ -29,11 +29,11 @@ pub const APP_CONFIG: AppConfig = AppConfig {
         rx_gpio: 17, // XIAO ESP32-C6 D7
     },
     wifi: WifiConfig {
-        ssid: "replace-me",
-        password: "replace-me",
+        ssid: "gavhome",
+        password: "Gavinagreattime!",
     },
     base_station: BaseStationConfig {
-        ip: "192.168.50.1",
+        ip: "192.168.68.74",
         registration_port: 59_000,
         initial_mower_id: 1,
     },
