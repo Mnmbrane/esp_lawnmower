@@ -12,10 +12,7 @@ use embassy_futures::select::{Either, select};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_net::{Config as NetConfig, Ipv4Address, Runner, Stack, StackResources};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::Channel;
-use embassy_sync::mutex::Mutex;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant as EmbassyInstant, Timer};
 use embedded_io_async::Write;
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
@@ -40,9 +37,6 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 static WIFI_INTERFACE: StaticCell<WifiInterface<'static>> = StaticCell::new();
 static NET_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
-static TELEMETRY_CHANNEL: Channel<CriticalSectionRawMutex, GpsTelemetryPacket, 1> = Channel::new();
-static COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, MotionCommand, 4> = Channel::new();
-static MOWER_POSE: Mutex<CriticalSectionRawMutex, MowerPose> = Mutex::new(MowerPose::new());
 
 #[derive(Clone, Copy, Debug)]
 enum RegistrationError {
@@ -69,6 +63,7 @@ struct MowerPose {
     lon: f32,
     heading_deg: f32,
     speed_mps: f32,
+    remaining_distance_m: f32,
     motion_state: MotionState,
     telemetry_enabled: bool,
 }
@@ -76,10 +71,11 @@ struct MowerPose {
 impl MowerPose {
     const fn new() -> Self {
         Self {
-            lat: 37.7749,
-            lon: -122.4194,
-            heading_deg: 315.0,
+            lat: 37.775299,
+            lon: -122.419800,
+            heading_deg: 0.0,
             speed_mps: 0.5,
+            remaining_distance_m: 0.0,
             motion_state: MotionState::Idle,
             telemetry_enabled: false,
         }
@@ -127,105 +123,6 @@ async fn basestation_task(stack: Stack<'static>) -> ! {
         }
 
         Timer::after(Duration::from_secs(1)).await;
-    }
-}
-
-#[embassy_executor::task]
-async fn telemetry_task() -> ! {
-    let mut telemetry_seq_num = 1_u16;
-
-    loop {
-        let maybe_pose = {
-            let mut pose = MOWER_POSE.lock().await;
-            if !pose.telemetry_enabled {
-                None
-            } else {
-                if pose.motion_state == MotionState::MovingForward {
-                    let distance_m = pose.speed_mps;
-                    advance_pose(&mut pose, distance_m);
-                }
-                Some(*pose)
-            }
-        };
-
-        if let Some(pose) = maybe_pose {
-            info!(
-                "Telemetry pose: lat={} lon={} heading={} state={:?} speed_mps={}.",
-                pose.lat, pose.lon, pose.heading_deg, pose.motion_state, pose.speed_mps,
-            );
-            let telemetry = fake_gps_telemetry(telemetry_seq_num, pose);
-            let _ = TELEMETRY_CHANNEL.try_send(telemetry);
-            telemetry_seq_num = telemetry_seq_num.wrapping_add(1);
-        }
-        Timer::after(Duration::from_secs(1)).await;
-    }
-}
-
-#[embassy_executor::task]
-async fn motion_task() -> ! {
-    loop {
-        let command = COMMAND_CHANNEL.receive().await;
-        match command.command_id {
-            Some(MowerCommandId::Move) => {
-                let mut pose = MOWER_POSE.lock().await;
-                pose.motion_state = MotionState::MovingForward;
-                pose.telemetry_enabled = true;
-                info!(
-                    "MOVE command received: seq={} -> state=MovingForward speed_mps={} heading={}.",
-                    command.packet_seq_num, pose.speed_mps, pose.heading_deg,
-                );
-            }
-            Some(MowerCommandId::Turn) => {
-                let angle_deg = decode_f32_param(command);
-                if let Some(angle_deg) = angle_deg {
-                    let mut pose = MOWER_POSE.lock().await;
-                    pose.heading_deg = normalize_heading(pose.heading_deg + angle_deg);
-                    info!(
-                        "TURN command received: seq={} angle_deg={} -> heading={}.",
-                        command.packet_seq_num, angle_deg, pose.heading_deg,
-                    );
-                } else {
-                    info!(
-                        "TURN command received: seq={} ack_req={} param_len={} decode=failed.",
-                        command.packet_seq_num, command.ack_requested, command.param_len,
-                    );
-                }
-            }
-            Some(MowerCommandId::Pause) => {
-                let mut pose = MOWER_POSE.lock().await;
-                pose.motion_state = MotionState::Paused;
-                info!(
-                    "PAUSE command received: seq={} -> state=Paused.",
-                    command.packet_seq_num
-                );
-            }
-            Some(MowerCommandId::Resume) => {
-                let mut pose = MOWER_POSE.lock().await;
-                pose.motion_state = MotionState::MovingForward;
-                info!(
-                    "RESUME command received: seq={} -> state=MovingForward.",
-                    command.packet_seq_num
-                );
-            }
-            Some(MowerCommandId::Stop) => {
-                let mut pose = MOWER_POSE.lock().await;
-                pose.motion_state = MotionState::Stopped;
-                info!(
-                    "STOP command received: seq={} ack_req={} -> state=Stopped.",
-                    command.packet_seq_num, command.ack_requested,
-                );
-            }
-            _ => {
-                info!(
-                    "Motion task queued command: seq={} cmd={:?}/0x{:04x} ack_req={} param_len={}.",
-                    command.packet_seq_num,
-                    command.command_id,
-                    command.raw_command_id,
-                    command.ack_requested,
-                    command.param_len,
-                );
-            }
-        }
     }
 }
 
@@ -310,64 +207,221 @@ async fn run_udp_session(
     );
 
     let server_endpoint = (server_ip, assigned_ctrl_port);
+    let mut pose = MowerPose::new();
+    let mut telemetry_seq_num = 1_u16;
+    let telemetry_interval = Duration::from_secs(1);
+    let mut next_telemetry_at = EmbassyInstant::now() + telemetry_interval;
+    let poll_interval = Duration::from_millis(100);
 
     loop {
         let mut cmd_buffer = [0_u8; 1024];
+        let now = EmbassyInstant::now();
+        let time_until_tick = next_telemetry_at
+            .checked_duration_since(now)
+            .unwrap_or(Duration::from_millis(0));
+        let wait_duration = if time_until_tick < poll_interval {
+            time_until_tick
+        } else {
+            poll_interval
+        };
         match select(
             socket.recv_from(&mut cmd_buffer),
-            TELEMETRY_CHANNEL.receive(),
+            Timer::after(wait_duration),
         )
         .await
         {
             Either::First(recv_result) => {
-                    let (bytes_read, _endpoint) =
-                        recv_result.map_err(|_| UdpSessionError::ReceiveFailed)?;
-                    info!("UDP RX bytes={}", bytes_read);
-                    log_hexdump("UDP RX", &cmd_buffer[..bytes_read], 32);
+                let (bytes_read, _endpoint) =
+                    recv_result.map_err(|_| UdpSessionError::ReceiveFailed)?;
+                info!("UDP RX bytes={}", bytes_read);
+                log_hexdump("UDP RX", &cmd_buffer[..bytes_read], 32);
 
-                    let orig_seq_num = parse_u16_le(&cmd_buffer, 2).unwrap_or(0);
-                    let mut should_ack = false;
-                    if let Some(command) = MowerCommandPacket::decode(&cmd_buffer[..bytes_read]) {
-                        log_command(command, bytes_read);
-                        should_ack = command.ack_request_flag != 0;
-                        let motion_command = MotionCommand {
-                            packet_seq_num: command.packet_seq_num,
-                            command_id: command.command_id,
+                let orig_seq_num = parse_u16_le(&cmd_buffer, 2).unwrap_or(0);
+                let mut should_ack = false;
+                if let Some(command) = MowerCommandPacket::decode(&cmd_buffer[..bytes_read]) {
+                    log_command(command, bytes_read);
+                    should_ack = command.ack_request_flag != 0;
+                    let motion_command = MotionCommand {
+                        packet_seq_num: command.packet_seq_num,
+                        command_id: command.command_id,
                         raw_command_id: command.raw_command_id,
                         ack_requested: command.ack_request_flag != 0,
                         param_len: command.control_parameter.len(),
                         param_bytes: first_param_bytes(command.control_parameter),
                     };
-                    let _ = COMMAND_CHANNEL.try_send(motion_command);
+                    apply_motion_command(&mut pose, motion_command);
                 } else {
                     info!(
                         "Received UDP command packet: bytes={} seq={} decode=failed.",
                         bytes_read, orig_seq_num
-                        );
-                    }
+                    );
+                }
 
-                    if should_ack {
-                        let ack = AckPacket::new(
-                            orig_seq_num,
-                            APP_CONFIG.base_station.initial_mower_id,
-                            unix_time_u16(),
-                        );
-                        socket
-                            .send_to(ack.as_bytes(), server_endpoint)
-                            .await
-                            .map_err(|_| UdpSessionError::AckSendFailed)?;
-                        info!("Sent UDP ACK for seq {}.", orig_seq_num);
+                if should_ack {
+                    let ack = AckPacket::new(
+                        orig_seq_num,
+                        APP_CONFIG.base_station.initial_mower_id,
+                        unix_time_u16(),
+                    );
+                    socket
+                        .send_to(ack.as_bytes(), server_endpoint)
+                        .await
+                        .map_err(|_| UdpSessionError::AckSendFailed)?;
+                    info!("Sent UDP ACK for seq {}.", orig_seq_num);
+                } else {
+                    info!("UDP ACK not requested for seq {}.", orig_seq_num);
+                }
+            }
+            Either::Second(_) => {}
+        }
+
+        while EmbassyInstant::now() >= next_telemetry_at {
+            let maybe_pose = if !pose.telemetry_enabled {
+                None
+            } else {
+                if pose.motion_state == MotionState::MovingForward {
+                    if pose.remaining_distance_m > 0.0 {
+                        let distance_m = if pose.speed_mps < pose.remaining_distance_m {
+                            pose.speed_mps
+                        } else {
+                            pose.remaining_distance_m
+                        };
+                        advance_pose(&mut pose, distance_m);
+                        pose.remaining_distance_m -= distance_m;
+                        if pose.remaining_distance_m <= 0.0 {
+                            pose.remaining_distance_m = 0.0;
+                            pose.motion_state = MotionState::Idle;
+                        }
                     } else {
-                        info!("UDP ACK not requested for seq {}.", orig_seq_num);
+                        pose.motion_state = MotionState::Idle;
                     }
                 }
-                Either::Second(telemetry) => {
+                Some(pose)
+            };
+
+            if let Some(pose) = maybe_pose {
+                info!(
+                    "Telemetry tick: seq={} lat={} lon={} heading={} state={:?} speed_mps={} remaining_distance_m={}.",
+                    telemetry_seq_num,
+                    pose.lat,
+                    pose.lon,
+                    pose.heading_deg,
+                    pose.motion_state,
+                    pose.speed_mps,
+                    pose.remaining_distance_m,
+                );
+                let telemetry = fake_gps_telemetry(telemetry_seq_num, pose);
                 socket
                     .send_to(telemetry.as_bytes(), server_endpoint)
                     .await
                     .map_err(|_| UdpSessionError::TelemetrySendFailed)?;
                 info!("Sent telemetry packet seq={}.", telemetry.packet_seq_num);
+                telemetry_seq_num = telemetry_seq_num.wrapping_add(1);
             }
+
+            next_telemetry_at = next_telemetry_at + telemetry_interval;
+        }
+    }
+}
+
+fn apply_motion_command(pose: &mut MowerPose, command: MotionCommand) {
+    info!(
+        "Applying motion command: seq={} cmd={:?}/0x{:04x} ack_req={} param_len={}.",
+        command.packet_seq_num,
+        command.command_id,
+        command.raw_command_id,
+        command.ack_requested,
+        command.param_len,
+    );
+
+    match command.command_id {
+        Some(MowerCommandId::Move) => {
+            if let Some(distance_m) = decode_f32_param(command) {
+                pose.remaining_distance_m = if distance_m.is_finite() && distance_m > 0.0 {
+                    distance_m
+                } else {
+                    0.0
+                };
+            }
+            pose.motion_state = MotionState::MovingForward;
+            pose.telemetry_enabled = true;
+            info!(
+                "MOVE command applied: seq={} distance_m={} lat={} lon={} heading={} state={:?} speed_mps={}.",
+                command.packet_seq_num,
+                pose.remaining_distance_m,
+                pose.lat,
+                pose.lon,
+                pose.heading_deg,
+                pose.motion_state,
+                pose.speed_mps,
+            );
+        }
+        Some(MowerCommandId::Turn) => {
+            if let Some(angle_deg) = decode_f32_param(command) {
+                pose.heading_deg = normalize_heading(pose.heading_deg + angle_deg);
+                info!(
+                    "TURN command applied: seq={} angle_deg={} -> lat={} lon={} heading={} state={:?}.",
+                    command.packet_seq_num,
+                    angle_deg,
+                    pose.lat,
+                    pose.lon,
+                    pose.heading_deg,
+                    pose.motion_state,
+                );
+            } else {
+                info!(
+                    "TURN command failed to decode: seq={} ack_req={} param_len={}.",
+                    command.packet_seq_num, command.ack_requested, command.param_len,
+                );
+            }
+        }
+        Some(MowerCommandId::Pause) => {
+            pose.motion_state = MotionState::Paused;
+            info!(
+                "PAUSE command applied: seq={} remaining_distance_m={} lat={} lon={} heading={} state={:?}.",
+                command.packet_seq_num,
+                pose.remaining_distance_m,
+                pose.lat,
+                pose.lon,
+                pose.heading_deg,
+                pose.motion_state,
+            );
+        }
+        Some(MowerCommandId::Resume) => {
+            pose.motion_state = MotionState::MovingForward;
+            info!(
+                "RESUME command applied: seq={} remaining_distance_m={} lat={} lon={} heading={} state={:?} speed_mps={}.",
+                command.packet_seq_num,
+                pose.remaining_distance_m,
+                pose.lat,
+                pose.lon,
+                pose.heading_deg,
+                pose.motion_state,
+                pose.speed_mps,
+            );
+        }
+        Some(MowerCommandId::Stop) => {
+            pose.motion_state = MotionState::Stopped;
+            pose.remaining_distance_m = 0.0;
+            info!(
+                "STOP command applied: seq={} ack_req={} lat={} lon={} heading={} state={:?}.",
+                command.packet_seq_num,
+                command.ack_requested,
+                pose.lat,
+                pose.lon,
+                pose.heading_deg,
+                pose.motion_state,
+            );
+        }
+        _ => {
+            info!(
+                "Unhandled motion command: seq={} cmd={:?}/0x{:04x} ack_req={} param_len={}.",
+                command.packet_seq_num,
+                command.command_id,
+                command.raw_command_id,
+                command.ack_requested,
+                command.param_len,
+            );
         }
     }
 }
@@ -497,14 +551,14 @@ impl core::fmt::Display for HexLine<'_> {
 }
 
 fn decode_f32_param(command: MotionCommand) -> Option<f32> {
-    if command.param_len < 4 {
+    if command.param_len < 6 {
         return None;
     }
     Some(f32::from_le_bytes([
-        command.param_bytes[0],
-        command.param_bytes[1],
         command.param_bytes[2],
         command.param_bytes[3],
+        command.param_bytes[4],
+        command.param_bytes[5],
     ]))
 }
 
@@ -516,13 +570,16 @@ fn first_param_bytes(bytes: &[u8]) -> [u8; 8] {
 }
 
 fn normalize_heading(mut heading_deg: f32) -> f32 {
-    while heading_deg < 0.0 {
-        heading_deg += 360.0;
+    if !heading_deg.is_finite() {
+        return 0.0;
     }
-    while heading_deg >= 360.0 {
-        heading_deg -= 360.0;
+
+    let normalized = libm::fmodf(heading_deg, 360.0);
+    if normalized < 0.0 {
+        normalized + 360.0
+    } else {
+        normalized
     }
-    heading_deg
 }
 
 fn advance_pose(pose: &mut MowerPose, distance_m: f32) {
@@ -621,8 +678,6 @@ async fn main(spawner: Spawner) -> ! {
         }
     }
     spawner.spawn(basestation_task(net_stack).unwrap());
-    spawner.spawn(telemetry_task().unwrap());
-    spawner.spawn(motion_task().unwrap());
 
     info!("Embassy initialized!");
     info!(

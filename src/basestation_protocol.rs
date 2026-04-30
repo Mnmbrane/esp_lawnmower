@@ -42,8 +42,8 @@ impl MowerCommandId {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GpsFixStatus {
-    Void = 0,
-    Valid = 1,
+    Void = b'V' as isize,
+    Valid = b'A' as isize,
 }
 
 impl GpsFixStatus {
@@ -99,7 +99,7 @@ pub struct GpsTelemetryPacket {
     pub mower_id: u16,
     pub utc_timestamp: u16,
     pub utc_of_gps_fix: u16,
-    // 1 = valid, 0 = void. This mirrors RMC A/V at the current wire level.
+    // The BST currently uses a char field carrying RMC-style 'A' / 'V'.
     pub gps_fix_status: u8,
     pub latitude: f32,
     pub lat_hemisphere: u8,
@@ -118,7 +118,7 @@ pub struct MowerCommandPacket {
     pub mower_id: u16,
     pub utc_timestamp: u16,
     pub ack_request_flag: u8,
-    pub reserved: u32,
+    pub reserved: [u8; 3],
     pub control_command: u16,
     pub control_param_length: u16,
     pub control_parameter: [u8; 256],
@@ -133,7 +133,7 @@ impl Default for MowerCommandPacket {
             mower_id: 0,
             utc_timestamp: 0,
             ack_request_flag: 0,
-            reserved: 0,
+            reserved: [0; 3],
             control_command: 0,
             control_param_length: 0,
             control_parameter: [0; 256],
@@ -253,8 +253,11 @@ impl GpsTelemetryPacket {
 
 impl MowerCommandPacket {
     pub const PACKET_LEN: usize = core::mem::size_of::<Self>();
-    const HEADER_LEN: usize = 20;
-    const PARAM_OFFSET: usize = 20;
+    // With ack_request_flag + reserved[3], the BST currently lays out:
+    // control_command at byte 12, control_param_length at byte 14, and the
+    // variable parameter payload at byte 16.
+    const HEADER_LEN: usize = 16;
+    const PARAM_OFFSET: usize = 16;
     const PARAM_CAPACITY: usize = 256;
 
     pub fn decode(bytes: &[u8]) -> Option<DecodedMowerCommand<'_>> {
@@ -262,8 +265,8 @@ impl MowerCommandPacket {
             return None;
         }
 
-        let raw_command_id = read_u16_le(bytes, 16)?;
-        let param_len = read_u16_le(bytes, 18)? as usize;
+        let raw_command_id = read_u16_le(bytes, 12)?;
+        let param_len = read_u16_le(bytes, 14)? as usize;
         let available_param_bytes = bytes.len().saturating_sub(Self::PARAM_OFFSET);
         let param_len = core::cmp::min(
             core::cmp::min(param_len, Self::PARAM_CAPACITY),
